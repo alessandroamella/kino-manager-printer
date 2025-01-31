@@ -132,7 +132,7 @@ def print_ricevuta(data):
         p.text("*NON FISCALE*\n")
 
         p.set(align='center')
-        p.text("\nGrazie e arrivederci!")
+        p.text("\nGrazie e arrivederci!\n")
 
         # remove comment to print receipt
         p.cut()
