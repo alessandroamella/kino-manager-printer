@@ -1,5 +1,6 @@
+#!/usr/bin/env python3
+
 from escpos.printer import Usb
-from time import sleep
 
 VENDOR_ID = int("0x1fc9", 16)
 PRODUCT_ID = int("0x2016", 16)
@@ -7,18 +8,19 @@ PRODUCT_ID = int("0x2016", 16)
 try:
     p = Usb(VENDOR_ID, PRODUCT_ID)
 
-    # To reset most settings back to default:
-    p.hw('RESET')
-    sleep(0.5)
-    p.hw('INIT')
-    sleep(0.5)
-    p.set(normal_textsize=True)
-    print("Printer initialized (settings reset to default).")
+    p.set(align='center')
+    p.text("Test print\n")
 
-    # ... Continue printing, settings should be back to default ...
+    p.set(align='left')
+    for i in range(5):
+        p.text(f" - Item {i}\n")
 
-    p.text("This text should be in default style.\nSciao belo kebab scinque euro\n")
+    p.set(align='center')
+    p.text("Total: $5.00\n")
+
     p.cut()
+
+    print("Printing completed")
 
     print("Minimal test print command sent.")
 except Exception as e:

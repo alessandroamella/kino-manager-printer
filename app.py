@@ -1,181 +1,187 @@
+#!/usr/bin/env python3
+
+import argparse
 import socketio
-import sys
+import json
+import time
+import redis
 from escpos.printer import Usb
+from datetime import datetime
+import threading
+import logging
+from typing import Dict, Any
+from print_receipt import print_receipt
 
-# SocketIO Client Configuration
-SOCKET_IO_SERVER_URL = 'ws://localhost:5001'
-SOCKET_IO_NAMESPACE = '/purchase'
-sio = socketio.Client()
-
-# Printer Configuration
-VENDOR_ID = int("0x1fc9", 16)
-PRODUCT_ID = int("0x2016", 16)
-
-p = None  # Initialize p to None outside the try block
-try:
-    p = Usb(VENDOR_ID, PRODUCT_ID)
-    p.hw('INIT')
-    print("Printer connected successfully!")
-except Exception as e:
-    print(f"Error connecting to printer: {e}")
-    sys.exit(1)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-def format_pos_text(left: str = "", right: str = "", alignment: str = "left"):
-    max_width = 48
+class PrinterQueue:
+    def __init__(self, redis_host='localhost', redis_port=6379):
+        self.redis_client = redis.Redis(
+            host=redis_host, port=redis_port, decode_responses=True)
+        self.queue_key = 'printer_queue'
+        self.processing_key = 'processing_queue'
+        self.max_retries = 5
+        self.retry_delay = 30  # seconds
 
-    if alignment == "left":
-        return left.ljust(max_width)[:max_width]
-
-    elif alignment == "right":
-        return right.rjust(max_width)[:max_width]
-
-    elif alignment == "both":
-        space_available = max_width - len(left) - len(right)
-        if space_available < 1:
-            return (left + " " + right)[:max_width]
-        return left + (" " * space_available) + right
-
-    else:
-        raise ValueError(
-            "Invalid alignment. Choose 'left', 'right', or 'both'.")
-
-
-def format_price_it(price):
-    try:
-        # Handle comma as decimal in input strings
-        price_float = float(str(price).replace(",", "."))
-        formatted_price = "{:.2f}".format(price_float).replace(".", ",")
-        return f"{formatted_price} EUR"
-    except ValueError:
-        return str(price)  # Return original value if not convertible to float
-
-
-# Example:
-data = {
-    "id": "62",
-    "purchaseDate": "2025-01-31T14:32:11.426Z",
-    "purchasedItems": [
-        {
-            "quantity": "2",
-            "item": {
-                "id": "7",
-                "name": "Estathé Pesca Bottiglia",
-                "nameShort": None,
-                "description": None,
-                "price": "1,5"
-            }
-        },
-        {
-            "quantity": 1,
-            "item": {
-                "id": "20",
-                "name": "Acqua",
-                "nameShort": None,
-                "description": None,
-                "price": "0,5"
-            }
+    def add_to_queue(self, receipt_data: Dict[str, Any]) -> str:
+        """Add a receipt to the queue with metadata."""
+        job_id = f"job_{int(time.time())}_{receipt_data['id']}"
+        job_data = {
+            'receipt_data': receipt_data,
+            'attempts': 0,
+            'created_at': datetime.now().isoformat(),
+            'status': 'pending'
         }
-    ],
-    "discount": "0.00",
-    "paymentMethod": "CARTE DI CREDITO",
-    "total": "3.5",
-    "givenAmount": "5,00",
-    "change": "1,50"
-}
+        self.redis_client.hset(self.queue_key, job_id, json.dumps(job_data))
+        logger.info(f"Added job {job_id} to queue")
+        return job_id
+
+    def get_next_job(self) -> tuple[str, dict] | None:
+        """Get the next job from the queue."""
+        for job_id in self.redis_client.hkeys(self.queue_key):
+            job_data = json.loads(
+                self.redis_client.hget(self.queue_key, job_id))
+            if (job_data['status'] == 'pending' and
+                    job_data['attempts'] < self.max_retries):
+                return job_id, job_data
+        return None
+
+    def mark_job_complete(self, job_id: str):
+        """Mark a job as completed and remove it from the queue."""
+        self.redis_client.hdel(self.queue_key, job_id)
+        logger.info(f"Job {job_id} completed successfully")
+
+    def mark_job_failed(self, job_id: str, job_data: dict, error: str):
+        """Mark a job as failed and update retry information."""
+        job_data['attempts'] += 1
+        job_data['last_error'] = str(error)
+        job_data['last_attempt'] = datetime.now().isoformat()
+
+        if job_data['attempts'] >= self.max_retries:
+            job_data['status'] = 'failed'
+            logger.error(
+                f"Job {job_id} failed permanently after {self.max_retries} "
+                f"attempts: {error}")
+        else:
+            logger.warning(
+                f"Job {job_id} failed, attempt {job_data['attempts']}/"
+                f"{self.max_retries}: {error}"
+            )
+
+        self.redis_client.hset(self.queue_key, job_id, json.dumps(job_data))
 
 
-def print_ricevuta(data):
-    if p is None:
-        print("Printer not initialized, skipping receipt printing.")
-        return
+class PrinterManager:
+    def __init__(self, vendor_id: int, product_id: int):
+        self.vendor_id = vendor_id
+        self.product_id = product_id
+        self.printer = None
+        self.queue = PrinterQueue()
+        self.connect_printer()
 
+    def connect_printer(self) -> bool:
+        """Attempt to connect to the printer."""
+        try:
+            self.printer = Usb(self.vendor_id, self.product_id)
+            self.printer.hw('INIT')
+            logger.info("Printer connected successfully!")
+            return True
+        except Exception as e:
+            logger.error(f"Error connecting to printer: {e}")
+            self.printer = None
+            return False
+
+    def process_queue(self):
+        """Main loop for processing the print queue."""
+        while True:
+            try:
+                job = self.queue.get_next_job()
+                if job:
+                    job_id, job_data = job
+                    self.print_receipt(job_id, job_data)
+                time.sleep(5)  # Wait before checking for new jobs
+            except Exception as e:
+                logger.error(f"Error in process_queue: {e}")
+                time.sleep(5)
+
+    def print_receipt(self, job_id: str, job_data: dict):
+        """Attempt to print a receipt."""
+        try:
+            if not self.printer:
+                if not self.connect_printer():
+                    raise Exception("Printer not available")
+
+            receipt_data = job_data['receipt_data']
+            print_receipt(receipt_data, self.printer)
+            self.queue.mark_job_complete(job_id)
+
+        except Exception as e:
+            self.printer = None  # Reset printer connection
+            self.queue.mark_job_failed(job_id, job_data, str(e))
+            time.sleep(self.queue.retry_delay)  # Wait before retrying
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Run the script in dev or prod mode.')
+    parser.add_argument('--mode', '-m', choices=['dev', 'prod'], default='dev',
+                        help='Specify the mode: dev or prod. Defaults to dev.')
+    args = parser.parse_args()
+
+    if args.mode == 'dev':
+        SOCKET_IO_SERVER_URL = 'ws://localhost:5001'
+    else:
+        SOCKET_IO_SERVER_URL = 'ws://cafe.kinocampus.it/purchase'
+    SOCKET_IO_NAMESPACE = '/purchase'
+
+    # Initialize printer manager
+    printer_manager = PrinterManager(
+        vendor_id=int("0x1fc9", 16),
+        product_id=int("0x2016", 16)
+    )
+
+    # Start queue processor in a separate thread
+    queue_thread = threading.Thread(
+        target=printer_manager.process_queue, daemon=True)
+    queue_thread.start()
+
+    # Socket.IO setup
+    sio = socketio.Client()
+
+    @sio.event(namespace=SOCKET_IO_NAMESPACE)
+    def connect():
+        logger.info("Connected to server!")
+
+    @sio.event(namespace=SOCKET_IO_NAMESPACE)
+    def connect_error(data):
+        logger.error(f"Connection failed: {data}")
+
+    @sio.event(namespace=SOCKET_IO_NAMESPACE)
+    def disconnect():
+        logger.info("Disconnected from server!")
+
+    @sio.on('purchase-created', namespace=SOCKET_IO_NAMESPACE)
+    def purchase_created(data):
+        logger.info("New purchase created!")
+        printer_manager.queue.add_to_queue(data)
+
+    # Connect to Socket.IO server
     try:
-        p.set(align='center', normal_textsize=True)
-        p.image('logo.png')
-        p.text("\nVia Piave, 3\n")
-        p.text("41018 - San Cesario sul Panaro (MO)\n")
-        p.text("kinocafesancesario@gmail.com\n")
-        p.text(f"{'-' * 32}\n")
-
-        p.set(align='left')
-        p.text(format_pos_text("DESCRIZIONE", "EURO", "both"))
-
-        p.set(double_height=False, double_width=False)
-
-        for purchased_item in data["purchasedItems"]:
-            item = purchased_item["item"]
-            left_str = item["name"]
-            formatted_price = format_price_it(item["price"])
-            right_str = f"{purchased_item['quantity']}x {formatted_price}"
-            p.text(format_pos_text(left_str, right_str, "both"))
-
-        p.set(align='center')
-        p.text(f"{'-' * 32}\n")
-
-        p.set(align='left')
-        formatted_total = format_price_it(data['total'])
-        p.text(format_pos_text("TOTALE COMPLESSIVO", formatted_total, "both"))
-
-        formatted_givenAmount = format_price_it(data['givenAmount'])
-        p.text(format_pos_text(
-            data['paymentMethod'], formatted_givenAmount, "both"))
-
-        if data.get('change'):
-            formatted_change = format_price_it(data['change'])
-            p.text(format_pos_text("Resto", formatted_change, "both"))
-
-        p.set(align='center')
-        p.text(f"\n\n{data['purchaseDate']}\n")
-        p.text(f"\nID Acquisto: #{str(data['id']).zfill(4)}\n")
-
-        p.text("*NON FISCALE*\n")
-
-        p.set(align='center')
-        p.text("\nGrazie e arrivederci!\n")
-
-        # remove comment to print receipt
-        p.cut()
-
+        logger.info(f"Connecting to server at {SOCKET_IO_SERVER_URL}...")
+        sio.connect(SOCKET_IO_SERVER_URL, namespaces=[
+                    SOCKET_IO_NAMESPACE], retry=True)
+        sio.wait()
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        sio.disconnect()
     except Exception as e:
-        print(f"Error printing receipt: {e}")
-
-
-def handle_new_purchase(data):
-    print("New purchase created!")
-    print("Purchase Data:", data)
-    print_ricevuta(data)
-
-
-@ sio.event(namespace=SOCKET_IO_NAMESPACE)
-def connect():
-    print("Connected to server!")
-
-
-@ sio.event(namespace=SOCKET_IO_NAMESPACE)
-def connect_error(data):
-    print(f"Connection failed: {data}")
-
-
-@ sio.event(namespace=SOCKET_IO_NAMESPACE)
-def disconnect():
-    print("Disconnected from server!")
-
-
-@ sio.on('purchase-created', namespace=SOCKET_IO_NAMESPACE)
-def purchase_created(data):
-    handle_new_purchase(data)
+        logger.error(f"Error: {e}")
 
 
 if __name__ == '__main__':
-    try:
-        sio.connect(SOCKET_IO_SERVER_URL, namespaces=[
-                    SOCKET_IO_NAMESPACE], retry=True)
-        sio.wait()  # Keep the script running and listening for events
-    except socketio.exceptions.ConnectionError as e:
-        print(f"Failed to connect to server: {e}")
-    except KeyboardInterrupt:
-        print("Disconnecting...")
-        if p:
-            p.close()  # Close printer connection on exit
-        sio.disconnect()
+    main()
