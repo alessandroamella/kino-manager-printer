@@ -1,10 +1,6 @@
 import logging
 from escpos.printer import Usb
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +45,7 @@ def print_receipt(data, printer: Usb):
         printer.image('logo.png')
         printer.text("\nVia Piave, 3\n")
         printer.text("41018 - San Cesario sul Panaro (MO)\n")
+        printer.text('cafe.kinocampus.it\n')
         printer.text("kinocafesancesario@gmail.com\n")
         printer.text(f"{'-' * 32}\n")
 
