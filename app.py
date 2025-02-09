@@ -119,7 +119,14 @@ class PrinterQueue:
 
 
 class PrinterManager:
-    def __init__(self, vendor_id: int, product_id: int):
+    def __init__(self, vendor_id: int = int("0x1fc9", 16), product_id: int = int("0x2016", 16)):
+        """
+        Initializes the PrinterManager.
+
+        Args:
+            vendor_id (int): USB Vendor ID of the printer. Defaults to 0x1fc9 (in decimal).
+            product_id (int): USB Product ID of the printer. Defaults to 0x2016 (in decimal).
+        """
         self.vendor_id = vendor_id
         self.product_id = product_id
         self.printer = None
@@ -132,10 +139,12 @@ class PrinterManager:
         try:
             self.printer = Usb(self.vendor_id, self.product_id)
             self.printer.hw('INIT')
-            logger.info("Printer connected successfully!")
+            logger.info(
+                f"Printer connected successfully! Vendor ID: {self.vendor_id}, Product ID: {self.product_id}")
             return True
         except Exception as e:
-            logger.error(f"Error connecting to printer: {e}")
+            logger.error(
+                f"Error connecting to printer (Vendor ID: {self.vendor_id}, Product ID: {self.product_id}): {e}")
             self.printer = None
             return False
 
@@ -208,9 +217,14 @@ class PrinterManager:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Run the script in dev or prod mode.')
+        description='Run the script in dev or prod mode and configure printer USB.')
     parser.add_argument('--mode', '-m', choices=['dev', 'prod'], default='prod',
                         help='Specify the mode: dev or prod. Defaults to prod.')
+    parser.add_argument('--vendor-id', type=lambda x: int(x, 0), default=int("0x1fc9", 16),
+                        help='USB Vendor ID of the printer (hexadecimal or decimal). Defaults to 0x1fc9.')
+    parser.add_argument('--product-id', type=lambda x: int(x, 0), default=int("0x2016", 16),
+                        help='USB Product ID of the printer (hexadecimal or decimal). Defaults to 0x2016.')
+
     args = parser.parse_args()
 
     if args.mode == 'dev':
@@ -221,10 +235,10 @@ def main():
 
     logger.info(f"Running in {args.mode} mode")
 
-    # Initialize printer manager
+    # Initialize printer manager with parameters from command line
     printer_manager = PrinterManager(
-        vendor_id=int("0x1fc9", 16),
-        product_id=int("0x2016", 16)
+        vendor_id=args.vendor_id,
+        product_id=args.product_id
     )
 
     logger.info("Starting printer queue processor...")
