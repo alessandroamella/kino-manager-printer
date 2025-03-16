@@ -1,2 +1,5 @@
-python-socketio[client]==5.12.1
-python-escpos[all]==3.1
+socketio
+python-socketio
+python-escpos
+websocket-client
+pyusb
